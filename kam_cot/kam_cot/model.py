@@ -276,15 +276,16 @@ class KAMCoTModel(nn.Module):
 
         def _embed(node_names: List[str]) -> torch.Tensor:
             embeddings = []
+            device = embed_tokens.weight.device
             for name in node_names:
                 if name == '<pad>':
-                    embeddings.append(torch.zeros(self.d_model))
+                    embeddings.append(torch.zeros(self.d_model, device=device))
                     continue
                 tokens = tokenizer.tokenize(name.replace('_', ' '))
                 if not tokens:
                     tokens = ['<unk>']
                 ids = tokenizer.convert_tokens_to_ids(tokens)
-                ids_t = torch.tensor(ids, device=embed_tokens.weight.device)
+                ids_t = torch.tensor(ids, device=device)
                 emb = embed_tokens(ids_t).mean(dim=0)  # (d_model,)
                 embeddings.append(emb)
             return torch.stack(embeddings, dim=0)

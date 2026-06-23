@@ -25,7 +25,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.dataloader import default_collate
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import get_linear_schedule_with_warmup
+from transformers import get_linear_schedule_with_warmup
 
 
 # ============================================================================
@@ -208,9 +208,13 @@ def kam_cot_collate(batch: List[Dict]) -> Dict:
 
     # pixel_values
     if 'pixel_values' in batch[0]:
-        imgs = [b['pixel_values'] for b in batch if 'pixel_values' in b]
+        imgs = [b['pixel_values'] for b in batch if 'pixel_values' in b and b['pixel_values'] is not None]
         if imgs:
-            result['pixel_values'] = torch.stack(imgs)
+            dummy = torch.zeros_like(imgs[0])
+            result['pixel_values'] = torch.stack([
+                b['pixel_values'] if b.get('pixel_values') is not None else dummy
+                for b in batch
+            ])
         else:
             result['pixel_values'] = None
 
@@ -319,7 +323,7 @@ class KAMCoTTrainer:
 
         # FP16 scaler
         self.use_fp16 = config.fp16 and config.device == 'cuda'
-        self.scaler = torch.cuda.amp.GradScaler() if self.use_fp16 else None
+        self.scaler = torch.amp.GradScaler('cuda') if self.use_fp16 else None
 
         self.global_step = 0
         self.epoch = 0
@@ -342,10 +346,9 @@ class KAMCoTTrainer:
         return on_device
 
     def train_step(self, batch: Dict) -> float:
-        """Một step training."""
         batch = self._move_batch(batch)
 
-        with torch.cuda.amp.autocast(enabled=self.use_fp16):
+        with torch.amp.autocast('cuda', enabled=self.use_fp16):
             outputs = self.model(
                 input_ids=batch['input_ids'],
                 attention_mask=batch['attention_mask'],
@@ -363,7 +366,10 @@ class KAMCoTTrainer:
         else:
             loss.backward()
 
-        return loss.item() * self.config.gradient_accumulation_steps
+        loss_val = loss.item() * self.config.gradient_accumulation_steps
+        if loss_val != loss_val:  # NaN guard
+            return 0.0
+        return loss_val
 
     def optimizer_step(self):
         """Clip gradients và step optimizer."""
@@ -426,7 +432,7 @@ class KAMCoTTrainer:
         print(f"{'='*50}\n")
 
         self.model.train()
-        self.model.zero_grad()
+        self.optimizer.zero_grad()
         start = time.time()
 
         for epoch in range(self.config.num_epochs):
@@ -444,14 +450,14 @@ class KAMCoTTrainer:
                 if self.global_step % self.config.gradient_accumulation_steps == 0:
                     self.optimizer_step()
 
-                # Logging
                 if self.global_step % self.config.logging_steps == 0:
                     avg = self.tr_loss / self.config.logging_steps
                     lr = self.scheduler.get_last_lr()[0]
                     elapsed = time.time() - start
+                    status = f"Loss {avg:.4f}" if not (avg != avg) else "Loss NaN"
                     print(
                         f"  Stage {self.config.stage} | Epoch {epoch+1} | "
-                        f"Step {self.global_step} | Loss {avg:.4f} | "
+                        f"Step {self.global_step} | {status} | "
                         f"LR {lr:.2e} | {elapsed:.0f}s"
                     )
                     self.tr_loss = 0.0
@@ -491,3 +497,111 @@ class KAMCoTTrainer:
         print(f"{'='*50}\n")
 
         return {'steps': self.global_step, 'best_loss': self.best_loss}
+
+
+# ============================================================================
+#  Training setup helpers (dùng cho notebook Colab)
+# ============================================================================
+
+def setup_stage1_training(
+    model: nn.Module,
+    tokenizer,
+    train_data: List[Dict],
+    eval_data: Optional[List[Dict]] = None,
+    config: TrainingConfig = None,
+    kg_extractor=None,
+    image_processor=None,
+) -> KAMCoTTrainer:
+    """
+    Tiện ích khởi tạo Stage 1 training (rationale generation).
+
+    Tạo dataset + trainer từ config có sẵn, tự động lấy node_embed_fn từ model.
+    """
+    node_embed_fn = model.get_node_embed_fn(tokenizer)
+
+    train_dataset = KAMCoTDataset(
+        data=train_data,
+        tokenizer=tokenizer,
+        image_processor=image_processor,
+        stage=1,
+        kg_extractor=kg_extractor,
+        node_embed_fn=node_embed_fn,
+        max_text_length=config.max_text_length,
+        max_target_length=config.max_target_length,
+    )
+    eval_dataset = None
+    if eval_data is not None:
+        eval_dataset = KAMCoTDataset(
+            data=eval_data,
+            tokenizer=tokenizer,
+            image_processor=image_processor,
+            stage=1,
+            kg_extractor=kg_extractor,
+            node_embed_fn=node_embed_fn,
+            max_text_length=config.max_text_length,
+            max_target_length=config.max_target_length,
+        )
+
+    return KAMCoTTrainer(
+        model=model,
+        config=config,
+        tokenizer=tokenizer,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+    )
+
+
+def setup_stage2_training(
+    model: nn.Module,
+    tokenizer,
+    train_data: List[Dict],
+    eval_data: Optional[List[Dict]] = None,
+    config: TrainingConfig = None,
+    kg_extractor=None,
+    image_processor=None,
+    freeze_encoder: bool = True,
+) -> KAMCoTTrainer:
+    """
+    Tiện ích khởi tạo Stage 2 training (answer prediction).
+
+    - Đóng băng encoder (language/vision/graph)
+    - Tạo dataset + trainer
+    """
+    if freeze_encoder:
+        for name, param in model.named_parameters():
+            if any(k in name for k in ('language_encoder', 'vision_encoder', 'graph_encoder')):
+                param.requires_grad = False
+        print("[Stage 2] Frozen: language_encoder, vision_encoder, graph_encoder")
+
+    node_embed_fn = model.get_node_embed_fn(tokenizer)
+
+    train_dataset = KAMCoTDataset(
+        data=train_data,
+        tokenizer=tokenizer,
+        image_processor=image_processor,
+        stage=2,
+        kg_extractor=kg_extractor,
+        node_embed_fn=node_embed_fn,
+        max_text_length=config.max_text_length,
+        max_target_length=config.max_target_length,
+    )
+    eval_dataset = None
+    if eval_data is not None:
+        eval_dataset = KAMCoTDataset(
+            data=eval_data,
+            tokenizer=tokenizer,
+            image_processor=image_processor,
+            stage=2,
+            kg_extractor=kg_extractor,
+            node_embed_fn=node_embed_fn,
+            max_text_length=config.max_text_length,
+            max_target_length=config.max_target_length,
+        )
+
+    return KAMCoTTrainer(
+        model=model,
+        config=config,
+        tokenizer=tokenizer,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+    )

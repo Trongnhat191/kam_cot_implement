@@ -79,18 +79,22 @@ class RGATLayer(nn.Module):
         K = self.W_k(x)
         V = self.W_v(x)
 
-        # Build simple adjacency
-        adj = torch.zeros(N, N, device=x.device)
-        src, tgt = edge_index
-        adj[src, tgt] = 1.0
+        # Build adjacency with self-loops (prevent all-zero rows → NaN softmax)
+        adj = torch.eye(N, device=x.device)
+        if edge_index.numel() > 0:
+            src, tgt = edge_index
+            adj[src, tgt] = 1.0
 
         # Simplified attention (relation-agnostic)
-        attn = torch.mm(Q, K.transpose(0, 1)) / self.scale
+        # Use float32 for numerical stability
+        attn = torch.mm(Q.float(), K.float().transpose(0, 1)) / self.scale
         attn = attn.masked_fill(adj == 0, float('-inf'))
         attn = F.softmax(attn, dim=-1)
+        # Safety: replace any remaining NaN (fully isolated nodes) with 0
+        attn = torch.nan_to_num(attn, nan=0.0)
         attn = self.dropout(attn)
 
-        out = torch.mm(attn, V)
+        out = torch.mm(attn, V.float()).to(x.dtype)
         out = self.W_o(out)
         return out
 
@@ -116,18 +120,16 @@ class GCNLayer(nn.Module):
         if self.use_pyg:
             return self.conv(x, edge_index)
 
-        # Fallback: simplified GCN
+        # Fallback: simplified GCN (in float32 for stability)
         N = x.size(0)
-        adj = torch.zeros(N, N, device=x.device)
-        src, tgt = edge_index
-        adj[src, tgt] = 1.0
-        adj = adj + torch.eye(N, device=x.device)
-        deg = adj.sum(dim=1).pow(-0.5)
-        deg[deg == float('inf')] = 0
+        adj = torch.eye(N, device=x.device, dtype=torch.float32)
+        if edge_index.numel() > 0:
+            src, tgt = edge_index
+            adj[src, tgt] = 1.0
+        deg = adj.sum(dim=1).clamp(min=1.0).pow(-0.5)
         adj_norm = deg.unsqueeze(1) * adj * deg.unsqueeze(0)
 
-        out = self.W(adj_norm @ x)
-        out = self.dropout(out)
+        out = self.W(adj_norm @ x.float()).to(x.dtype)
         return out
 
 

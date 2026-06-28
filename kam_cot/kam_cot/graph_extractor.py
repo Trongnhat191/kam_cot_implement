@@ -6,7 +6,7 @@ Trích xuất đồ thị tri thức từ ConceptNet 5.5.
 Quy trình:
   1. Trích xuất thực thể từ câu hỏi / ngữ cảnh
   2. Query ConceptNet mở rộng 1-hop và 2-hop
-  3. Cắt tỉa còn tối đa p = 200 nodes
+  3. Cắt tỉa còn tối đa p = 50 nodes
   4. Gán nhãn node bằng averaged embeddings từ Language Encoder
   5. Xây dựng edge_index và edge_type
 
@@ -27,7 +27,7 @@ class ConceptNetExtractor:
     
     Tham số:
       language   : ngôn ngữ (mặc định 'en')
-      max_nodes  : tối đa số nodes (mặc định 200)
+      max_nodes  : tối đa số nodes (mặc định 50)
       max_hops   : số hop mở rộng (mặc định 2)
       device     : thiết bị tính toán
     """
@@ -42,7 +42,7 @@ class ConceptNetExtractor:
     def __init__(
         self,
         language: str = 'en',
-        max_nodes: int = 200,
+        max_nodes: int = 50,
         max_hops: int = 2,
         db_path: str = "./conceptnet.db",
         device: torch.device = None,

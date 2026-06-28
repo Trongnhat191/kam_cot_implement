@@ -48,7 +48,7 @@ class TrainingConfig:
     # Data
     max_text_length: int = 512
     max_target_length: int = 128
-    max_nodes: int = 200
+    max_nodes: int = 50
 
     # Training
     batch_size: int = 4
@@ -69,7 +69,7 @@ class TrainingConfig:
     output_dir: str = "./kam_cot_output"
     logging_steps: int = 10
     save_steps: int = 500
-    eval_steps: int = 200
+    eval_steps: int = 50
     save_total_limit: int = 3
 
     # Hardware
@@ -116,6 +116,26 @@ class KAMCoTDataset(Dataset):
         self.node_embed_fn = node_embed_fn
         self.max_text_length = max_text_length
         self.max_target_length = max_target_length
+
+        # Pre-cache KG data (one-time cost instead of per-step)
+        self._kg_cache = {}
+        if kg_extractor is not None and node_embed_fn is not None:
+            import time
+            print(f"  [KG Cache] Pre-extracting KG for {len(data)} samples...")
+            t0 = time.time()
+            for idx in range(len(data)):
+                text = self._get_text(data[idx])
+                with torch.no_grad():
+                    kg = kg_extractor.build_graph_data(text, node_embed_fn)
+                # Detach and move to CPU for storage
+                self._kg_cache[idx] = {
+                    'kg_node_features': kg['node_features'].detach().cpu(),
+                    'kg_edge_index': kg['edge_index'].detach().cpu(),
+                    'kg_edge_type': kg['edge_type'].detach().cpu(),
+                }
+                if (idx + 1) % 500 == 0:
+                    print(f"    ... {idx+1}/{len(data)} ({time.time()-t0:.0f}s)")
+            print(f"  [KG Cache] Done in {time.time()-t0:.0f}s")
 
     def __len__(self):
         return len(self.data)
@@ -186,12 +206,9 @@ class KAMCoTDataset(Dataset):
         if pixel_vals is not None:
             result['pixel_values'] = pixel_vals
 
-        # Knowledge Graph
-        if self.kg_extractor is not None and self.node_embed_fn is not None:
-            kg = self.kg_extractor.build_graph_data(text, self.node_embed_fn)
-            result['kg_node_features'] = kg['node_features']
-            result['kg_edge_index'] = kg['edge_index']
-            result['kg_edge_type'] = kg['edge_type']
+        # Knowledge Graph (from pre-cached data)
+        if idx in self._kg_cache:
+            result.update(self._kg_cache[idx])
 
         return result
 
@@ -300,7 +317,7 @@ class KAMCoTTrainer:
             batch_size=config.batch_size,
             shuffle=True,
             collate_fn=kam_cot_collate,
-            num_workers=0,
+            num_workers=32,
         )
         self.eval_loader = None
         if eval_dataset is not None:
@@ -309,7 +326,7 @@ class KAMCoTTrainer:
                 batch_size=config.batch_size,
                 shuffle=False,
                 collate_fn=kam_cot_collate,
-                num_workers=0,
+                num_workers=32,
             )
 
         # Scheduler
@@ -348,6 +365,17 @@ class KAMCoTTrainer:
     def train_step(self, batch: Dict) -> float:
         batch = self._move_batch(batch)
 
+        # Debug: kiểm tra labels có bị toàn -100 không
+        if self.global_step < 5:
+            labels = batch['labels']
+            valid = (labels != -100).sum().item()
+            total = labels.numel()
+            print(f"  [DEBUG step {self.global_step}] labels shape={tuple(labels.shape)}, "
+                  f"valid tokens={valid}/{total} "
+                  f"({100*valid/total:.1f}%)")
+            if valid == 0:
+                print("  [WARNING] All labels are -100! Loss will be 0.")
+
         with torch.amp.autocast('cuda', enabled=self.use_fp16):
             outputs = self.model(
                 input_ids=batch['input_ids'],
@@ -359,6 +387,11 @@ class KAMCoTTrainer:
                 labels=batch['labels'],
             )
             loss = outputs['loss']
+
+            # Debug: kiểm tra loss
+            if self.global_step < 5:
+                print(f"  [DEBUG step {self.global_step}] raw loss={loss.item():.6f}")
+
             loss = loss / self.config.gradient_accumulation_steps
 
         if self.scaler is not None:

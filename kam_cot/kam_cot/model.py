@@ -26,6 +26,7 @@ Sơ đồ luồng:
 from typing import Dict, List, Optional
 import torch
 import torch.nn as nn
+from transformers.modeling_outputs import BaseModelOutput
 
 from .cross_attention import CrossAttention
 from .gated_fusion import GatedFusion
@@ -122,6 +123,7 @@ class KAMCoTModel(nn.Module):
             dict với H_fuse và các hidden states trung gian
         """
         batch_size = input_ids.size(0)
+        _debug = not hasattr(self, '_debug_done')
 
         # --- A. Language Encoding ---
         lang_out = self.language_encoder(
@@ -130,31 +132,54 @@ class KAMCoTModel(nn.Module):
             return_dict=True,
         )
         H_lang = self.norm_lang(lang_out.last_hidden_state)  # (B, n, d)
+        if _debug and H_lang.isnan().any():
+            print(f"  [NaN TRACE] H_lang has NaN!")
 
         # --- B. Vision Encoding ---
         if pixel_values is not None:
             H_img = self.vision_encoder(pixel_values)        # (B, m, d)
             H_img = self.norm_img(H_img)
+            if _debug and H_img.isnan().any():
+                print(f"  [NaN TRACE] H_img has NaN!")
         else:
-            H_img = torch.zeros(batch_size, 1, self.d_model, device=H_lang.device)
+            H_img = torch.zeros(batch_size, 1, self.d_model,
+                                device=H_lang.device, dtype=H_lang.dtype)
 
         # --- C. Graph Encoding ---
         if kg_node_features is not None and kg_edge_index is not None:
             total_nodes = kg_node_features.size(0)
             H_kg_flat = self.graph_encoder(kg_node_features, kg_edge_index, kg_edge_type)
+            if _debug and H_kg_flat.isnan().any():
+                print(f"  [NaN TRACE] H_kg_flat (graph encoder output) has NaN!")
             H_kg_flat = self.norm_kg(H_kg_flat)
             p = total_nodes // batch_size
             H_kg = H_kg_flat.view(batch_size, p, self.d_model)  # (B, p, d)
         else:
-            H_kg = torch.zeros(batch_size, 1, self.d_model, device=H_lang.device)
+            H_kg = torch.zeros(batch_size, 1, self.d_model,
+                               device=H_lang.device, dtype=H_lang.dtype)
 
-        # --- D. Cross-Attention ---
-        H_img_attn = self.cross_attn_img(query=H_lang, key=H_img, value=H_img)  # (B, n, d)
-        H_kg_attn  = self.cross_attn_kg(query=H_lang, key=H_kg, value=H_kg)     # (B, n, d)
+        # --- D. Cross-Attention (in float32 for stability) ---
+        H_lang_f32 = H_lang.float()
+        H_img_f32 = H_img.float()
+        H_kg_f32 = H_kg.float()
+
+        H_img_attn = self.cross_attn_img(query=H_lang_f32, key=H_img_f32, value=H_img_f32)
+        if _debug and H_img_attn.isnan().any():
+            print(f"  [NaN TRACE] H_img_attn (cross_attn_img) has NaN!")
+        H_kg_attn = self.cross_attn_kg(query=H_lang_f32, key=H_kg_f32, value=H_kg_f32)
+        if _debug and H_kg_attn.isnan().any():
+            print(f"  [NaN TRACE] H_kg_attn (cross_attn_kg) has NaN!")
 
         # --- E. Gated Fusion ---
-        H_fuse = self.gated_fusion(H_lang, H_img_attn, H_kg_attn)  # (B, n, d)
+        H_fuse = self.gated_fusion(H_lang_f32, H_img_attn.float(), H_kg_attn.float())
         H_fuse = self.norm_fuse(H_fuse)
+
+        if _debug:
+            if H_fuse.isnan().any():
+                print(f"  [NaN TRACE] H_fuse has NaN!")
+            else:
+                print(f"  [NaN TRACE] All clear — no NaN in H_fuse")
+            self._debug_done = True
 
         return {
             'H_fuse': H_fuse,
@@ -164,6 +189,7 @@ class KAMCoTModel(nn.Module):
             'H_img_attn': H_img_attn,
             'H_kg_attn': H_kg_attn,
         }
+
 
     def forward(
         self,
@@ -209,10 +235,14 @@ class KAMCoTModel(nn.Module):
         if decoder_input_ids is not None:
             decoder_kwargs['decoder_input_ids'] = decoder_input_ids
 
+        encoder_outputs = BaseModelOutput(
+            last_hidden_state=enc_out['H_fuse'],
+        )
+
         t5_out = self.t5(
             input_ids=None,
             attention_mask=attention_mask,
-            encoder_outputs=(enc_out['H_fuse'],),
+            encoder_outputs=encoder_outputs,
             return_dict=True,
             **decoder_kwargs,
         )
@@ -255,8 +285,12 @@ class KAMCoTModel(nn.Module):
         defaults = dict(max_length=128, num_beams=4, early_stopping=True)
         defaults.update(gen_kwargs)
 
+        encoder_outputs = BaseModelOutput(
+            last_hidden_state=enc_out['H_fuse'],
+        )
+
         return self.t5.generate(
-            encoder_outputs=(enc_out['H_fuse'],),
+            encoder_outputs=encoder_outputs,
             attention_mask=attention_mask,
             **defaults,
         )

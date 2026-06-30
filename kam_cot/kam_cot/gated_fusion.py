@@ -55,10 +55,20 @@ class GatedFusion(nn.Module):
         Returns:
             H_fuse: (B, n, d) fused features
         """
+        # Clamp inputs for numerical stability
+        H_lang = torch.clamp(H_lang, min=-1e4, max=1e4)
+        H_img_attn = torch.clamp(H_img_attn, min=-1e4, max=1e4)
+        H_kg_attn = torch.clamp(H_kg_attn, min=-1e4, max=1e4)
+
         # Compute gate scores
         S_alpha = self.W1(H_lang) + self.W2(H_img_attn) + self.W3(H_kg_attn)
         S_beta  = self.W4(H_lang) + self.W5(H_img_attn) + self.W6(H_kg_attn)
         S_gamma = self.W7(H_lang) + self.W8(H_img_attn) + self.W9(H_kg_attn)
+
+        # Clamp gate scores before softmax
+        S_alpha = torch.clamp(S_alpha, min=-50, max=50)
+        S_beta = torch.clamp(S_beta, min=-50, max=50)
+        S_gamma = torch.clamp(S_gamma, min=-50, max=50)
 
         # Element-wise softmax over 3 modalities
         # Stack → (B, n, d, 3) → softmax over modality dim
@@ -71,4 +81,8 @@ class GatedFusion(nn.Module):
 
         # Weighted fusion
         H_fuse = alpha * H_lang + beta * H_img_attn + gamma * H_kg_attn
+        
+        # Clamp output
+        H_fuse = torch.clamp(H_fuse, min=-1e4, max=1e4)
+        
         return H_fuse

@@ -411,28 +411,36 @@ class KAMCoTTrainer:
 
             loss = loss / self.config.gradient_accumulation_steps
 
+        # NaN guard - skip batch if loss is NaN
+        loss_val = loss.item() * self.config.gradient_accumulation_steps
+        if loss_val != loss_val:  # NaN check
+            print(f"  [WARNING step {self.global_step}] NaN/Inf loss detected (loss={loss_val}) — skipping batch")
+            return 0.0
+
         if self.scaler is not None:
             self.scaler.scale(loss).backward()
         else:
             loss.backward()
 
-        loss_val = loss.item() * self.config.gradient_accumulation_steps
-        if loss_val != loss_val:  # NaN guard
-            return 0.0
         return loss_val
 
     def optimizer_step(self):
         """Clip gradients và step optimizer."""
         if self.scaler is not None:
-            self.scaler.unscale_(self.optimizer)
-
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(),
-                                       self.config.max_grad_norm)
-
-        if self.scaler is not None:
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+            # Only unscale if there are scaled gradients
+            # Check if any backward was called since last optimizer step
+            if self.scaler._scale is not None:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(),
+                                               self.config.max_grad_norm)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                # No gradients to update, skip
+                pass
         else:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(),
+                                           self.config.max_grad_norm)
             self.optimizer.step()
 
         self.scheduler.step()

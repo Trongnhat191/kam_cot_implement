@@ -98,6 +98,9 @@ class KAMCoTModel(nn.Module):
         self.norm_kg = nn.LayerNorm(self.d_model)
         self.norm_fuse = nn.LayerNorm(self.d_model)
         self.dropout = nn.Dropout(dropout)
+        
+        # Initialize weights for numerical stability
+        self._init_weights()
 
     def encode_multimodal(
         self,
@@ -336,3 +339,13 @@ class KAMCoTModel(nn.Module):
         total = sum(p.numel() for p in self.parameters())
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         return {'total': total, 'trainable': trainable}
+    
+    def _init_weights(self):
+        """Initialize weights for numerical stability."""
+        # Xavier uniform for linear layers in custom modules
+        for module in [self.cross_attn_img, self.cross_attn_kg, self.gated_fusion]:
+            for name, param in module.named_parameters():
+                if 'weight' in name and param.dim() >= 2:
+                    nn.init.xavier_uniform_(param, gain=0.02)  # Small gain for stability
+                elif 'bias' in name:
+                    nn.init.zeros_(param)

@@ -75,6 +75,10 @@ class RGATLayer(nn.Module):
 
         # Fallback: simplified attention
         N = x.size(0)
+        
+        # Clamp input for numerical stability
+        x = torch.clamp(x, min=-1e4, max=1e4)
+        
         Q = self.W_q(x)
         K = self.W_k(x)
         V = self.W_v(x)
@@ -88,14 +92,29 @@ class RGATLayer(nn.Module):
         # Simplified attention (relation-agnostic)
         # Use float32 for numerical stability
         attn = torch.mm(Q.float(), K.float().transpose(0, 1)) / self.scale
-        attn = attn.masked_fill(adj == 0, float('-inf'))
+        
+        # Clamp attention scores before masking
+        attn = torch.clamp(attn, min=-50, max=50)
+        
+        attn = attn.masked_fill(adj == 0, -1e9)  # Use -1e9 instead of -inf
         attn = F.softmax(attn, dim=-1)
-        # Safety: replace any remaining NaN (fully isolated nodes) with 0
-        attn = torch.nan_to_num(attn, nan=0.0)
+        
+        # Safety: replace any remaining NaN (fully isolated nodes) with uniform distribution
+        if torch.isnan(attn).any():
+            attn = torch.where(
+                torch.isnan(attn),
+                torch.ones_like(attn) / N,
+                attn
+            )
+        
         attn = self.dropout(attn)
 
         out = torch.mm(attn, V.float()).to(x.dtype)
         out = self.W_o(out)
+        
+        # Clamp output
+        out = torch.clamp(out, min=-1e4, max=1e4)
+        
         return out
 
 
@@ -177,6 +196,9 @@ class GraphEncoder(nn.Module):
         Returns:
             (total_nodes, d_model) node features đã cập nhật
         """
+        # Clamp input for numerical stability
+        x = torch.clamp(x, min=-1e4, max=1e4)
+        
         edge_attr = self.edge_embedding(edge_type)  # (E, 64)
 
         # Tầng 1: RGAT
@@ -185,6 +207,9 @@ class GraphEncoder(nn.Module):
         out = F.relu(out)
         out = self.dropout(out)
         x = x + out  # skip connection
+        
+        # Clamp after first layer
+        x = torch.clamp(x, min=-1e4, max=1e4)
 
         # Tầng 2: GCN
         out = self.gcn(x, edge_index)
@@ -192,5 +217,8 @@ class GraphEncoder(nn.Module):
         out = F.relu(out)
         out = self.dropout(out)
         x = x + out  # skip connection
+        
+        # Final clamp
+        x = torch.clamp(x, min=-1e4, max=1e4)
 
         return x

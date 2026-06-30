@@ -27,7 +27,7 @@ image = (
     .run_commands("cd /root/ScienceQA_Project && pip install -e .")
 )
 
-app = modal.App("ScienceQA-KAM-CoT")
+app = modal.App("ScienceQA-KAM-CoT-Evaluation")
 
 
 from PIL import Image as PILImage
@@ -48,17 +48,6 @@ def _resize_and_pad(img: PILImage.Image, size: int = 800) -> PILImage.Image:
 def _prepare_scienceqa_data(raw_dataset, image_processor, stage: int = 1):
     """
     Map derek-thomas/ScienceQA fields → KAMCoTDataset format.
-
-    ScienceQA fields:
-      image     : PIL Image or None
-      question  : str
-      choices   : List[str]
-      answer    : int (index into choices)
-      solution  : str (reasoning/rationale)
-      lecture   : str
-
-    KAMCoTDataset expects:
-      question, context, choices, answer (text), rationale, image/pixel_values
     """
     processed = []
     for item in raw_dataset:
@@ -68,7 +57,7 @@ def _prepare_scienceqa_data(raw_dataset, image_processor, stage: int = 1):
 
         solution_text = item.get('solution', '').strip()
         if not solution_text:
-            continue  # skip samples without rationale (would produce all -100 labels)
+            continue  # skip samples without rationale
 
         sample = {
             'question': item.get('question', ''),
@@ -101,15 +90,15 @@ def _prepare_scienceqa_data(raw_dataset, image_processor, stage: int = 1):
     volumes={"/cache": data_volume, "/data": cn_volume, "/output": output_volume},
     timeout=28800
 )
-def main():
+def evaluate():
     os.chdir("/root/ScienceQA_Project")
 
     print("=" * 60)
-    print("  KAM-CoT Training — ScienceQA")
+    print("  KAM-CoT Evaluation — ScienceQA Test Split")
     print("=" * 60)
 
     # ------------------------------------------------------------------
-    # 1. Load model & tokenizer
+    # 1. Load model config & tokenizer
     # ------------------------------------------------------------------
     from kam_cot import KAMCoTModel
     from transformers import T5Tokenizer, DetrImageProcessor
@@ -125,39 +114,30 @@ def main():
         dropout=0.1,
     )
 
-    print("\n[1] Loading model & tokenizer...")
-    model = KAMCoTModel(**MODEL_CONFIG)
+    print("\n[1] Loading tokenizer & image processor...")
     tokenizer = T5Tokenizer.from_pretrained(MODEL_CONFIG['model_name'])
     image_processor = DetrImageProcessor.from_pretrained(MODEL_CONFIG['vision_model'])
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = model.to(device)
     print(f"    Device: {device}")
-    print(f"    Parameters: {model.count_parameters()['total'] / 1e6:.1f}M")
 
     # ------------------------------------------------------------------
-    # 2. Load ScienceQA dataset from cached volume
+    # 2. Load test data
     # ------------------------------------------------------------------
     from datasets import load_dataset
 
-    print("\n[2] Loading ScienceQA from cached volume...")
-    ds_train = load_dataset(
+    print("\n[2] Loading ScienceQA test split...")
+    ds_test = load_dataset(
         "derek-thomas/ScienceQA",
-        split="train",
+        split="test",
         download_mode="force_redownload",
     )
-    ds_eval = load_dataset(
-        "derek-thomas/ScienceQA",
-        split="validation",
-        download_mode="force_redownload",
-    )
-    # get 40% of train for faster testing
-    ds_train = ds_train.shuffle(seed=42).select(range(int(len(ds_train) * 0.4)))
-    print(f"    Train samples (40%): {len(ds_train)}")
-    print(f"    Eval samples (full): {len(ds_eval)}")
+    print(f"    Test samples: {len(ds_test)}")
+    test_data = _prepare_scienceqa_data(ds_test, image_processor)
+    print(f"    Test samples (after filter): {len(test_data)}")
 
     # ------------------------------------------------------------------
-    # 3. KG Extractor
+    # 3. Setup KG extractor
     # ------------------------------------------------------------------
     from kam_cot import ConceptNetExtractor
 
@@ -169,167 +149,61 @@ def main():
         db_path="/data/conceptnet.db",
     )
 
-    node_embed_fn = model.get_node_embed_fn(tokenizer)
-
-    print("\n[4] Preparing dataset...")
-    train_data = _prepare_scienceqa_data(ds_train, image_processor)
-    eval_data  = _prepare_scienceqa_data(ds_eval,  image_processor)
-
-    print(f"    Train: {len(train_data)}")
-    print(f"    Eval:  {len(eval_data)}")
-
-    sample = train_data[0]
-    print(f"    Sample — Q: {sample['question'][:80]}...")
-    print(f"    Sample — Rationale: {sample['rationale'][:80]}...")
-    print(f"    Sample — Answer: {sample['answer']}")
-    print(f"    Sample — has image: {sample['pixel_values'] is not None}")
+    KG_CACHE_DIR = "/output/kg_cache"
 
     # ------------------------------------------------------------------
-    # 5. Training config
+    # 4. Load Stage 1 model for rationale generation
     # ------------------------------------------------------------------
-    from kam_cot.training import TrainingConfig, setup_stage1_training, setup_stage2_training
+    print("\n[4] Loading Stage 1 model for rationale generation...")
+    model_s1 = KAMCoTModel(**MODEL_CONFIG).to(device)
+    node_embed_fn_s1 = model_s1.get_node_embed_fn(tokenizer)
+
+    # Try to load best model first, then fallback to final
+    best_s1_path = "/output/kam_cot_output/best/model.pt"
+    final_s1_path = "/output/kam_cot_output/stage1_final/model.pt"
+    
+    if os.path.exists(best_s1_path):
+        s1_load_path = best_s1_path
+        print(f"    Loading best Stage 1 model from {s1_load_path}")
+    elif os.path.exists(final_s1_path):
+        s1_load_path = final_s1_path
+        print(f"    Loading final Stage 1 model from {s1_load_path}")
+    else:
+        print(f"    ERROR: No Stage 1 model found!")
+        print(f"    Checked paths:")
+        print(f"      - {best_s1_path}")
+        print(f"      - {final_s1_path}")
+        return
+
+    model_s1.load_state_dict(torch.load(s1_load_path, map_location=device))
+    model_s1.eval()
+    print(f"    Stage 1 model loaded successfully")
+
+    # ------------------------------------------------------------------
+    # 5. Evaluate Stage 1 — Generate rationales & compute ROUGE-L
+    # ------------------------------------------------------------------
+    from kam_cot.training import KAMCoTDataset, kam_cot_collate, TrainingConfig
+    from torch.utils.data import DataLoader
+    from rouge_score import rouge_scorer
+    import copy
+
+    print("\n[5] Evaluating Stage 1 — Rationale Generation (ROUGE-L)...")
 
     train_config = TrainingConfig(
         stage=1,
-        freeze_encoder=False,
-        batch_size=8,
-        gradient_accumulation_steps=2,
-        learning_rate=5e-5,
-        warmup_steps=100,
-        num_epochs=15,
+        batch_size=16,
         max_text_length=512,
         max_target_length=512,
         max_nodes=50,
-        fp16=False,
-        logging_steps=200,
-        eval_steps=1000,
-        save_steps=2000,
-        output_dir="/output/kam_cot_output",
-        weight_decay=0.01,
-        max_grad_norm=1.0,
     )
 
-    print("\n[5] Training config:")
-    print(f"    batch_size={train_config.batch_size}")
-    print(f"    accumulation={train_config.gradient_accumulation_steps}")
-    print(f"    effective_batch={train_config.batch_size * train_config.gradient_accumulation_steps}")
-    print(f"    epochs={train_config.num_epochs}")
-    print(f"    lr={train_config.learning_rate}")
-    print(f"    max_nodes={train_config.max_nodes}")
-
-    # ------------------------------------------------------------------
-    # 6. Train Stage 1
-    # ------------------------------------------------------------------
-    KG_CACHE_DIR = "/output/kg_cache"
-
-    print("\n[6] Starting Stage 1 training...")
-    trainer = setup_stage1_training(
-        model=model,
-        tokenizer=tokenizer,
-        train_data=train_data,
-        eval_data=eval_data,
-        config=train_config,
-        kg_extractor=kg_extractor,
-        image_processor=image_processor,
-        kg_cache_dir=KG_CACHE_DIR,
-    )
-    output_volume.commit()  # flush KG cache to persistent storage
-
-    results = trainer.train()
-    output_volume.commit()  # flush model checkpoints
-    print(f"\n[DONE] Stage 1 complete — {results}")
-
-    # ------------------------------------------------------------------
-    # 7. Re-initialize model for Stage 2 (identical initialization per paper)
-    # ------------------------------------------------------------------
-    print("\n[7] Preparing for Stage 2 (Answer Prediction)...")
-    print("    Re-initializing model from scratch (identical init per paper)...")
-
-    # Paper: "trained separately from identical initializations"
-    model_s2 = KAMCoTModel(**MODEL_CONFIG).to(device)
-    node_embed_fn_s2 = model_s2.get_node_embed_fn(tokenizer)
-
-    # Cấu hình Stage 2
-    train_config_s2 = TrainingConfig(
-        stage=2,
-        freeze_encoder=False,   # Identical init — train toàn bộ như Stage 1
-        batch_size=8,
-        gradient_accumulation_steps=2,
-        learning_rate=1e-5,     # LOWER LR for Stage 2 training from scratch (was 5e-5)
-        warmup_steps=200,       # More warmup for stability
-        num_epochs=15,
-        max_text_length=512,
-        max_target_length=32,
-        max_nodes=50,
-        fp16=False,
-        logging_steps=200,
-        eval_steps=1000,
-        save_steps=2000,
-        output_dir="/output/kam_cot_output_stage2",
-        weight_decay=0.01,
-        max_grad_norm=1.0,
-    )
-
-    # ------------------------------------------------------------------
-    # 8. Train Stage 2
-    # ------------------------------------------------------------------
-    print("\n[8] Starting Stage 2 training...")
-    trainer_s2 = setup_stage2_training(
-        model=model_s2,
-        tokenizer=tokenizer,
-        train_data=train_data,
-        eval_data=eval_data,
-        config=train_config_s2,
-        kg_extractor=kg_extractor,
-        image_processor=image_processor,
-        freeze_encoder=False,
-        kg_cache_dir=KG_CACHE_DIR,
-    )
-
-    results_s2 = trainer_s2.train()
-    output_volume.commit()  # flush model checkpoints cho Stage 2
-    print(f"\n[DONE] Stage 2 complete — {results_s2}")
-
-    # ------------------------------------------------------------------
-    # 9. Load test data
-    # ------------------------------------------------------------------
-    print("\n[9] Final evaluation on ScienceQA test split...")
-    import json
-    from datasets import load_dataset
-    from torch.utils.data import DataLoader
-    from kam_cot.training import KAMCoTDataset, kam_cot_collate
-    from rouge_score import rouge_scorer
-
-    ds_test = load_dataset(
-        "derek-thomas/ScienceQA",
-        split="test",
-        download_mode="force_redownload",
-    )
-    print(f"    Test samples: {len(ds_test)}")
-    test_data = _prepare_scienceqa_data(ds_test, image_processor)
-    print(f"    Test samples (after filter): {len(test_data)}")
-
-    # ------------------------------------------------------------------
-    # 9a. Test Stage 1 — Rationale Generation (ROUGE-L)
-    # ------------------------------------------------------------------
-    print("\n[9a] Testing Stage 1 — Rationale Generation (ROUGE-L)...")
-
-    # Load best Stage 1 model
-    best_s1_path = os.path.join(train_config.output_dir, "best", "model.pt")
-    final_s1_path = os.path.join(train_config.output_dir, "stage1_final", "model.pt")
-    s1_load_path = best_s1_path if os.path.exists(best_s1_path) else final_s1_path
-    print(f"    Loading Stage 1 model from {s1_load_path}")
-    model.load_state_dict(torch.load(s1_load_path, map_location=device))
-    model.eval()
-
-    # Stage 1 test dataset (input = Q+C+choices, target = rationale)
     test_dataset_s1 = KAMCoTDataset(
         data=test_data,
         tokenizer=tokenizer,
         image_processor=image_processor,
         stage=1,
         kg_extractor=kg_extractor,
-        node_embed_fn=node_embed_fn,
+        node_embed_fn=node_embed_fn_s1,
         max_text_length=train_config.max_text_length,
         max_target_length=train_config.max_target_length,
         kg_cache_path=os.path.join(KG_CACHE_DIR, "test_kg_s1.pt"),
@@ -344,17 +218,20 @@ def main():
         num_workers=4,
     )
 
-    # Generate rationales, compute ROUGE-L, and save for End-to-End Stage 2
     scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
     rouge_scores = []
-    generated_rationales = []  # Lưu rationale sinh ra để truyền cho Stage 2
+    generated_rationales = []
     sample_idx = 0
 
+    print(f"    Generating rationales for {len(test_data)} samples...")
     with torch.no_grad():
-        for batch in test_loader_s1:
+        for batch_idx, batch in enumerate(test_loader_s1):
+            if batch_idx % 10 == 0:
+                print(f"      Processing batch {batch_idx}/{len(test_loader_s1)}...")
+            
             batch_on_device = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                                for k, v in batch.items()}
-            gen_ids = model.generate(
+            gen_ids = model_s1.generate(
                 input_ids=batch_on_device['input_ids'],
                 attention_mask=batch_on_device['attention_mask'],
                 pixel_values=batch_on_device.get('pixel_values'),
@@ -374,30 +251,54 @@ def main():
                 sample_idx += 1
 
     avg_rougeL = sum(rouge_scores) / max(len(rouge_scores), 1)
-    print(f"    Stage 1 ROUGE-L: {avg_rougeL:.4f} ({len(rouge_scores)} samples)")
+    print(f"\n    ✓ Stage 1 ROUGE-L: {avg_rougeL:.4f} ({len(rouge_scores)} samples)")
 
     # ------------------------------------------------------------------
-    # 9b. Test Stage 2 — End-to-End Answer Prediction (Accuracy)
-    #      Dùng rationale SINH RA từ Stage 1, không dùng ground truth
+    # 6. Load Stage 2 model for answer prediction
     # ------------------------------------------------------------------
-    print("\n[9b] Testing Stage 2 — End-to-End Answer Prediction (Accuracy)...")
-    print("     Using generated rationales from Stage 1 as input (not ground truth)")
+    print("\n[6] Loading Stage 2 model for answer prediction...")
+    model_s2 = KAMCoTModel(**MODEL_CONFIG).to(device)
+    node_embed_fn_s2 = model_s2.get_node_embed_fn(tokenizer)
 
-    # Load best Stage 2 model
-    best_s2_path = os.path.join(train_config_s2.output_dir, "best", "model.pt")
-    final_s2_path = os.path.join(train_config_s2.output_dir, "stage2_final", "model.pt")
-    s2_load_path = best_s2_path if os.path.exists(best_s2_path) else final_s2_path
-    print(f"    Loading Stage 2 model from {s2_load_path}")
+    best_s2_path = "/output/kam_cot_output_stage2/best/model.pt"
+    final_s2_path = "/output/kam_cot_output_stage2/stage2_final/model.pt"
+    
+    if os.path.exists(best_s2_path):
+        s2_load_path = best_s2_path
+        print(f"    Loading best Stage 2 model from {s2_load_path}")
+    elif os.path.exists(final_s2_path):
+        s2_load_path = final_s2_path
+        print(f"    Loading final Stage 2 model from {s2_load_path}")
+    else:
+        print(f"    ERROR: No Stage 2 model found!")
+        print(f"    Checked paths:")
+        print(f"      - {best_s2_path}")
+        print(f"      - {final_s2_path}")
+        return
+
     model_s2.load_state_dict(torch.load(s2_load_path, map_location=device))
     model_s2.eval()
+    print(f"    Stage 2 model loaded successfully")
 
-    # Tạo bản sao test_data, thay rationale chuẩn bằng rationale sinh ra từ Stage 1
-    import copy
+    # ------------------------------------------------------------------
+    # 7. Evaluate Stage 2 — End-to-End Answer Prediction
+    # ------------------------------------------------------------------
+    print("\n[7] Evaluating Stage 2 — End-to-End Answer Prediction (Accuracy)...")
+    print("    Using generated rationales from Stage 1 as input (not ground truth)")
+
+    train_config_s2 = TrainingConfig(
+        stage=2,
+        batch_size=16s,
+        max_text_length=512,
+        max_target_length=32,
+        max_nodes=50,
+    )
+
+    # Replace ground truth rationales with generated ones
     test_data_e2e = copy.deepcopy(test_data)
     for i, gen_rat in enumerate(generated_rationales):
         test_data_e2e[i]['rationale'] = gen_rat
 
-    # Stage 2 test dataset (input = Q+C+choices + rationale sinh bởi Stage 1)
     test_dataset_s2 = KAMCoTDataset(
         data=test_data_e2e,
         tokenizer=tokenizer,
@@ -419,13 +320,16 @@ def main():
         num_workers=4,
     )
 
-    # Generate answers & compute Accuracy
     correct = 0
     total = 0
     sample_idx = 0
 
+    print(f"    Predicting answers for {len(test_data)} samples...")
     with torch.no_grad():
-        for batch in test_loader_s2:
+        for batch_idx, batch in enumerate(test_loader_s2):
+            if batch_idx % 10 == 0:
+                print(f"      Processing batch {batch_idx}/{len(test_loader_s2)}...")
+            
             batch_on_device = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                                for k, v in batch.items()}
             gen_ids = model_s2.generate(
@@ -444,7 +348,6 @@ def main():
                 ref_answer = test_data[sample_idx].get('answer', '').strip().lower()
                 pred_text = preds[i].strip().lower()
                 # Extract answer from generated text
-                # Format: "The answer is {answer}."
                 if 'the answer is' in pred_text:
                     pred_answer = pred_text.split('the answer is')[-1].strip().rstrip('.')
                 else:
@@ -455,26 +358,28 @@ def main():
                 sample_idx += 1
 
     accuracy = correct / max(total, 1)
-    print(f"    Stage 2 Accuracy (E2E): {accuracy:.4f} ({correct}/{total})")
+    print(f"\n    ✓ Stage 2 Accuracy (E2E): {accuracy:.4f} ({correct}/{total})")
 
     # ------------------------------------------------------------------
-    # 10. Summary & Save
+    # 8. Save results
     # ------------------------------------------------------------------
+    import json
+
     print(f"\n{'='*60}")
     print(f"  FINAL TEST RESULTS (End-to-End Pipeline)")
     print(f"  Stage 1 ROUGE-L:         {avg_rougeL:.4f}")
     print(f"  Stage 2 Accuracy (E2E):  {accuracy:.4f} ({correct}/{total})")
     print(f"{'='*60}\n")
 
-    result_path = os.path.join(train_config_s2.output_dir, "test_results.json")
+    result_path = "/output/kam_cot_output_stage2/test_results_evaluation.json"
     with open(result_path, 'w') as f:
         json.dump({
-            'stage1_train': results,
-            'stage2_train': results_s2,
             'test_stage1_rougeL': avg_rougeL,
             'test_stage2_accuracy_e2e': accuracy,
             'test_stage2_correct': correct,
             'test_stage2_total': total,
+            'stage1_model_path': s1_load_path,
+            'stage2_model_path': s2_load_path,
         }, f, indent=2)
     print(f"    Results saved to {result_path}")
     output_volume.commit()
@@ -482,4 +387,4 @@ def main():
 
 @app.local_entrypoint()
 def local_main():
-    main.remote()
+    evaluate.remote()

@@ -148,12 +148,17 @@ class KAMCoTModel(nn.Module):
         # --- C. Graph Encoding ---
         if kg_node_features is not None and kg_edge_index is not None:
             total_nodes = kg_node_features.size(0)
+            assert total_nodes % batch_size == 0, (
+                f"kg_node_features total_nodes ({total_nodes}) not divisible by "
+                f"batch_size ({batch_size}). Check collate function."
+            )
             H_kg_flat = self.graph_encoder(kg_node_features, kg_edge_index, kg_edge_type)
             if _debug and H_kg_flat.isnan().any():
                 print(f"  [NaN TRACE] H_kg_flat (graph encoder output) has NaN!")
             H_kg_flat = self.norm_kg(H_kg_flat)
-            p = total_nodes // batch_size
-            H_kg = H_kg_flat.view(batch_size, p, self.d_model)  # (B, p, d)
+            p = total_nodes // batch_size                       # = max_nodes
+            H_kg = H_kg_flat.view(batch_size, p, self.d_model)  # (B, max_nodes, d)
+
         else:
             H_kg = torch.zeros(batch_size, 1, self.d_model,
                                device=H_lang.device, dtype=H_lang.dtype)

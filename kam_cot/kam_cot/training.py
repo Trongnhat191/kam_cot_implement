@@ -107,6 +107,7 @@ class KAMCoTDataset(Dataset):
         node_embed_fn=None,
         max_text_length: int = 512,
         max_target_length: int = 128,
+        kg_cache_path: Optional[str] = None,
     ):
         self.data = data
         self.tokenizer = tokenizer
@@ -117,9 +118,15 @@ class KAMCoTDataset(Dataset):
         self.max_text_length = max_text_length
         self.max_target_length = max_target_length
 
-        # Pre-cache KG data (one-time cost instead of per-step)
+        # KG cache: load from disk → or extract & save → or skip
         self._kg_cache = {}
-        if kg_extractor is not None and node_embed_fn is not None:
+        if kg_cache_path and os.path.exists(kg_cache_path):
+            import time
+            t0 = time.time()
+            print(f"  [KG Cache] Loading from {kg_cache_path}...")
+            self._kg_cache = torch.load(kg_cache_path, weights_only=False)
+            print(f"  [KG Cache] Loaded {len(self._kg_cache)} samples in {time.time()-t0:.1f}s")
+        elif kg_extractor is not None and node_embed_fn is not None:
             import time
             print(f"  [KG Cache] Pre-extracting KG for {len(data)} samples...")
             t0 = time.time()
@@ -127,7 +134,6 @@ class KAMCoTDataset(Dataset):
                 text = self._get_text(data[idx])
                 with torch.no_grad():
                     kg = kg_extractor.build_graph_data(text, node_embed_fn)
-                # Detach and move to CPU for storage
                 self._kg_cache[idx] = {
                     'kg_node_features': kg['node_features'].detach().cpu(),
                     'kg_edge_index': kg['edge_index'].detach().cpu(),
@@ -135,13 +141,22 @@ class KAMCoTDataset(Dataset):
                 }
                 if (idx + 1) % 500 == 0:
                     print(f"    ... {idx+1}/{len(data)} ({time.time()-t0:.0f}s)")
-            print(f"  [KG Cache] Done in {time.time()-t0:.0f}s")
+            print(f"  [KG Cache] Extracted in {time.time()-t0:.0f}s")
+            # Save to disk for future runs
+            if kg_cache_path:
+                os.makedirs(os.path.dirname(kg_cache_path) or '.', exist_ok=True)
+                torch.save(self._kg_cache, kg_cache_path)
+                print(f"  [KG Cache] Saved to {kg_cache_path}")
 
     def __len__(self):
         return len(self.data)
 
     def _get_text(self, item: Dict) -> str:
-        """Xây dựng input text từ question, context, choices."""
+        """Xây dựng input text từ question, context, choices.
+        
+        Stage 1: X_lang^rat = [q; c; [a1, a2, ..., ak]]
+        Stage 2: X_lang^ans = [q; c; [a1, a2, ..., ak]; r]
+        """
         parts = []
         if item.get('context'):
             parts.append(f"Context: {item['context']}")
@@ -151,17 +166,21 @@ class KAMCoTDataset(Dataset):
                 f"({chr(65+i)}) {c}" for i, c in enumerate(item['choices'])
             )
             parts.append(f"Choices: {choices}")
+        # Stage 2: append rationale vào input để conditioning
+        if self.stage == 2 and item.get('rationale'):
+            parts.append(f"Rationale: {item['rationale']}")
         return ' '.join(parts)
 
     def _get_target(self, item: Dict) -> str:
-        """Xây dựng target text theo stage."""
+        """Xây dựng target text theo stage.
+        
+        Stage 1: target = rationale r
+        Stage 2: target = answer a (rationale đã nằm trong input)
+        """
         if self.stage == 1:
             return item.get('rationale', '')
         else:
-            rationale = item.get('rationale', '')
             answer = item.get('answer', '')
-            if rationale:
-                return f"{rationale} Therefore, the answer is {answer}."
             return f"The answer is {answer}."
 
     def _load_image(self, item: Dict):
@@ -236,34 +255,32 @@ def kam_cot_collate(batch: List[Dict]) -> Dict:
             result['pixel_values'] = None
 
     # KG data
-    if 'kg_node_features' in batch[0]:
-        # Xác định p (số nodes mỗi sample)
-        p_vals = [b['kg_node_features'].size(0) for b in batch if 'kg_node_features' in b]
-        if p_vals:
-            p = p_vals[0]  # tất cả đều = max_nodes
+    kg_samples = [b for b in batch if 'kg_node_features' in b and b['kg_node_features'] is not None]
+    if kg_samples:
+        p = kg_samples[0]['kg_node_features'].size(0)   # max_nodes
+        d = kg_samples[0]['kg_node_features'].size(1)   # d_model
 
-            # node_features: (batch * p, d)
-            result['kg_node_features'] = torch.cat(
-                [b['kg_node_features'] for b in batch if 'kg_node_features' in b], dim=0
-            )
+        # Pad missing samples with zeros — đảm bảo total_nodes = B * p
+        node_list = []
+        edge_list = []
+        type_list = []
+        for i, b in enumerate(batch):
+            if 'kg_node_features' in b and b['kg_node_features'] is not None:
+                node_list.append(b['kg_node_features'])
+                edge_list.append(b['kg_edge_index'] + i * p)
+                type_list.append(b['kg_edge_type'])
+            else:
+                # Zero-pad: không có edge, chỉ có self-loop tại node 0
+                node_list.append(torch.zeros(p, d))
+                edge_list.append(torch.zeros(2, 0, dtype=torch.long))
+                type_list.append(torch.zeros(0, dtype=torch.long))
 
-            # edge_index: cộng offset theo số nodes mỗi sample
-            edges = [b['kg_edge_index'] for b in batch if 'kg_edge_index' in b]
-            batched_edges = [
-                e + i * p for i, e in enumerate(edges)
-            ]
-            result['kg_edge_index'] = torch.cat(batched_edges, dim=1)
-
-            # edge_type: concat
-            result['kg_edge_type'] = torch.cat(
-                [b['kg_edge_type'] for b in batch if 'kg_edge_type' in b], dim=0
-            )
-
-            # kg_batch: (batch * p,) — chi sample nào thuộc node nào
-            result['kg_batch'] = torch.repeat_interleave(
-                torch.arange(len(batch)),
-                p
-            )
+        result['kg_node_features'] = torch.cat(node_list, dim=0)   # (B*p, d)
+        result['kg_edge_index'] = torch.cat(edge_list, dim=1)       # (2, E_total)
+        result['kg_edge_type'] = torch.cat(type_list, dim=0)        # (E_total,)
+        result['kg_batch'] = torch.repeat_interleave(
+            torch.arange(len(batch)), p
+        )
 
     return result
 
@@ -317,7 +334,7 @@ class KAMCoTTrainer:
             batch_size=config.batch_size,
             shuffle=True,
             collate_fn=kam_cot_collate,
-            num_workers=32,
+            num_workers=4,
         )
         self.eval_loader = None
         if eval_dataset is not None:
@@ -326,7 +343,7 @@ class KAMCoTTrainer:
                 batch_size=config.batch_size,
                 shuffle=False,
                 collate_fn=kam_cot_collate,
-                num_workers=32,
+                num_workers=4,
             )
 
         # Scheduler
@@ -426,27 +443,34 @@ class KAMCoTTrainer:
         """Evaluate trên eval set."""
         if self.eval_loader is None:
             return float('inf')
+        return self.evaluate_on(self.eval_loader)
 
+    def evaluate_on(self, loader, desc: str = "Eval") -> Dict:
+        """Evaluate trên bất kỳ DataLoader nào, trả về dict metrics."""
         self.model.eval()
         total_loss = 0.0
         n = 0
 
-        for batch in self.eval_loader:
-            batch = self._move_batch(batch)
-            outputs = self.model(
-                input_ids=batch['input_ids'],
-                attention_mask=batch['attention_mask'],
-                pixel_values=batch.get('pixel_values'),
-                kg_node_features=batch.get('kg_node_features'),
-                kg_edge_index=batch.get('kg_edge_index'),
-                kg_edge_type=batch.get('kg_edge_type'),
-                labels=batch['labels'],
-            )
-            total_loss += outputs['loss'].item()
-            n += 1
+        with torch.no_grad():
+            for batch in loader:
+                batch = self._move_batch(batch)
+                outputs = self.model(
+                    input_ids=batch['input_ids'],
+                    attention_mask=batch['attention_mask'],
+                    pixel_values=batch.get('pixel_values'),
+                    kg_node_features=batch.get('kg_node_features'),
+                    kg_edge_index=batch.get('kg_edge_index'),
+                    kg_edge_type=batch.get('kg_edge_type'),
+                    labels=batch['labels'],
+                )
+                total_loss += outputs['loss'].item()
+                n += 1
 
         self.model.train()
-        return total_loss / max(n, 1)
+        avg_loss = total_loss / max(n, 1)
+        print(f"  [{desc}] Loss: {avg_loss:.4f}  ({n} batches)")
+        return {'loss': avg_loss, 'n_batches': n}
+
 
     def save(self, name: str = "checkpoint"):
         """Save model checkpoint."""
@@ -497,7 +521,8 @@ class KAMCoTTrainer:
 
                 # Evaluation
                 if self.global_step % self.config.eval_steps == 0 and self.eval_loader is not None:
-                    eval_loss = self.evaluate()
+                    eval_result = self.evaluate()
+                    eval_loss = eval_result['loss'] if isinstance(eval_result, dict) else eval_result
                     print(f"  >> Eval loss: {eval_loss:.4f}")
                     if eval_loss < self.best_loss:
                         self.best_loss = eval_loss
@@ -544,13 +569,18 @@ def setup_stage1_training(
     config: TrainingConfig = None,
     kg_extractor=None,
     image_processor=None,
+    kg_cache_dir: Optional[str] = None,
 ) -> KAMCoTTrainer:
     """
     Tiện ích khởi tạo Stage 1 training (rationale generation).
 
     Tạo dataset + trainer từ config có sẵn, tự động lấy node_embed_fn từ model.
+    kg_cache_dir: thư mục lưu KG cache (ví dụ /output/kg_cache/).
     """
     node_embed_fn = model.get_node_embed_fn(tokenizer)
+
+    train_cache = os.path.join(kg_cache_dir, "train_kg.pt") if kg_cache_dir else None
+    eval_cache = os.path.join(kg_cache_dir, "eval_kg.pt") if kg_cache_dir else None
 
     train_dataset = KAMCoTDataset(
         data=train_data,
@@ -561,6 +591,7 @@ def setup_stage1_training(
         node_embed_fn=node_embed_fn,
         max_text_length=config.max_text_length,
         max_target_length=config.max_target_length,
+        kg_cache_path=train_cache,
     )
     eval_dataset = None
     if eval_data is not None:
@@ -573,6 +604,7 @@ def setup_stage1_training(
             node_embed_fn=node_embed_fn,
             max_text_length=config.max_text_length,
             max_target_length=config.max_target_length,
+            kg_cache_path=eval_cache,
         )
 
     return KAMCoTTrainer(
@@ -593,6 +625,7 @@ def setup_stage2_training(
     kg_extractor=None,
     image_processor=None,
     freeze_encoder: bool = True,
+    kg_cache_dir: Optional[str] = None,
 ) -> KAMCoTTrainer:
     """
     Tiện ích khởi tạo Stage 2 training (answer prediction).
@@ -608,6 +641,9 @@ def setup_stage2_training(
 
     node_embed_fn = model.get_node_embed_fn(tokenizer)
 
+    train_cache = os.path.join(kg_cache_dir, "train_kg_s2.pt") if kg_cache_dir else None
+    eval_cache = os.path.join(kg_cache_dir, "eval_kg_s2.pt") if kg_cache_dir else None
+
     train_dataset = KAMCoTDataset(
         data=train_data,
         tokenizer=tokenizer,
@@ -617,6 +653,7 @@ def setup_stage2_training(
         node_embed_fn=node_embed_fn,
         max_text_length=config.max_text_length,
         max_target_length=config.max_target_length,
+        kg_cache_path=train_cache,
     )
     eval_dataset = None
     if eval_data is not None:
@@ -629,6 +666,7 @@ def setup_stage2_training(
             node_embed_fn=node_embed_fn,
             max_text_length=config.max_text_length,
             max_target_length=config.max_target_length,
+            kg_cache_path=eval_cache,
         )
 
     return KAMCoTTrainer(
